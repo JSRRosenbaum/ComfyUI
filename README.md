@@ -216,6 +216,44 @@ This is the command to install the nightly with ROCm 7.2 which might have some p
 ```pip install --pre torch torchvision torchaudio --index-url https://download.pytorch.org/whl/nightly/rocm7.2```
 
 
+### Graft and shared Canopy admission (managed POSIX installs)
+
+This fork carries the ComfyUI hooks for
+[Graft](https://github.com/JSRRosenbaum/Graft), based on ComfyUI v0.42.5.
+Graft owns durable job placement, execution-owner affinity and supported
+checkpoint restoration. Canopy owns process lifecycle and host-local GPU
+admission. Grove is the private network context, not another scheduler.
+
+The qualified Graft deployment separates a persistent CPU-only editor and
+coordinator from demand-started ephemeral execution workers. The editor
+does not hold a GPU lease. An execution worker acquires canonical admission
+**before HIP initialization**, retains ownership through descendant cleanup
+and process retirement, and then releases it. Both hosts use the same code;
+installed models, runtime identities and admission policy determine eligibility.
+Only an explicit identity-matching preacceptance rejection permits fallback.
+Unknown acceptance must be reconciled by original identity, never resubmitted.
+
+Put the matching Graft checkout on `PYTHONPATH`. `GRAFT_CONFIG` is the path
+to a private role-config JSON file; `CANOPY_ADMISSION_CONFIG` contains the
+admission JSON itself, not a filename. Profiles pin existing regular-file
+lock inodes and the exact worker cgroup. HIP profiles
+also verify physical PCI/render/runtime mapping, foreign compute owners and
+resource budgets. Missing or ambiguous evidence fails closed. ComfyUI never
+creates the lock files; the obsolete `COMFY_GPU_LEASE_ROOT` and
+`COMFY_GPU_LEASE_DEVICES` variables are rejected.
+
+Do not remove a launch-time lease wrapper before the consuming runtime's
+admission path is installed and qualified. Do not stack the wrapper and
+runtime leases. Canopy reload can stop unrelated managed processes; activation
+requires an owner-coordinated maintenance window, not a free-lock snapshot.
+Process and lease cleanup are distinct from residual driver VRAM.
+
+The central [integration guide](https://github.com/JSRRosenbaum/Graft/blob/main/docs/integration.md)
+records lifecycle configuration, source pins, verification and supported limits.
+It is in the owner's private repository. This fork does not include deployment
+credentials, models, user workflows, outputs or operational databases.
+
+
 ### AMD GPUs (Windows, ROCm 10.0)
 
 Use AMD's [multi-architecture PyTorch packages](https://rocm.docs.amd.com/projects/ai-ecosystem/en/latest/frameworks/pytorch/install.html). The `device-*` extras install your GPU's kernels and the matching ROCm runtime automatically; a separate HIP SDK installation is not needed.

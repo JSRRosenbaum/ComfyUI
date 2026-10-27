@@ -453,6 +453,11 @@ async def execute(server: "ExecutionServer", dynprompt, caches, current_item, ex
 
     input_data_all = None
     try:
+        observer = getattr(server, "_graft_observer", None)
+        if observer is not None:
+            cache_key = caches.outputs.cache_key_set.get_data_key(unique_id)
+            side_effect = getattr(class_def, "OUTPUT_NODE", False) is True
+            observer.before_node(unique_id, cache_key, side_effect)
         if unique_id in pending_async_nodes:
             results = []
             for r in pending_async_nodes[unique_id]:
@@ -576,7 +581,7 @@ async def execute(server: "ExecutionServer", dynprompt, caches, current_item, ex
             enriched_output_ui = register_executed_outputs(output_ui, prompt_id, asset_manager, asset_previews)
             ui_outputs[unique_id] = {"meta": meta, "output": enriched_output_ui}
             cache_ui_value = {"meta": meta, "output": output_ui}
-            if server.client_id is not None:
+            if observer is None and server.client_id is not None:
                 server.send_sync("executed", { "node": unique_id, "display_node": display_node_id, "output": enriched_output_ui, "prompt_id": prompt_id }, server.client_id)
         if has_subgraph:
             cached_outputs = []
@@ -617,6 +622,10 @@ async def execute(server: "ExecutionServer", dynprompt, caches, current_item, ex
         cache_entry = CacheEntry(ui=cache_ui_value, outputs=output_data)
         execution_list.cache_update(unique_id, cache_entry)
         await caches.outputs.set(unique_id, cache_entry)
+        if observer is not None:
+            observer.after_node(unique_id, cache_entry, cache_key, side_effect)
+            if len(output_ui) > 0 and server.client_id is not None:
+                server.send_sync("executed", { "node": unique_id, "display_node": display_node_id, "output": enriched_output_ui, "prompt_id": prompt_id }, server.client_id)
 
     except comfy.model_management.InterruptProcessingException as iex:
         logging.info("Processing interrupted")
@@ -670,6 +679,7 @@ class PromptExecutor:
         self.server = server
         self.asset_manager = asset_manager if asset_manager is not None else NoAssets(args)
         self.prompt_model_tracker = comfy.model_patcher.PromptModelTracker()
+        self.observer = None
         self.reset()
 
     def reset(self):
@@ -751,6 +761,7 @@ class PromptExecutor:
         comfy.memory_management.set_ram_cache_release_state(ram_release_callback, ram_headroom)
 
         try:
+            self.server._graft_observer = self.observer
             with torch.inference_mode():
                 dynamic_prompt = DynamicPrompt(prompt)
                 reset_progress_state(prompt_id, dynamic_prompt)
@@ -759,6 +770,8 @@ class PromptExecutor:
                 for cache in self.caches.all:
                     await cache.set_prompt(dynamic_prompt, prompt.keys(), is_changed_cache)
                     cache.clean_unused()
+                if self.observer is not None:
+                    self.observer.restore(self.caches.outputs)
 
                 node_ids = list(prompt.keys())
                 cache_results = await asyncio.gather(
@@ -839,6 +852,7 @@ class PromptExecutor:
                 if comfy.model_management.DISABLE_SMART_MEMORY:
                     comfy.model_management.unload_all_models()
         finally:
+            self.server._graft_observer = None
             if self.cache_type == CacheType.RAM_PRESSURE:
                 detail("RAM cache evictions: prompt=%s active=%s full=%s", prompt_id, self.caches.outputs.active_evictions, self.caches.outputs.full_evictions)
             comfy.memory_management.set_ram_cache_release_state(None, 0)

@@ -1,8 +1,27 @@
+import json
+import os
+
+_GRAFT_CONFIG = None
+_GRAFT_LIFECYCLE = None
+_graft_config_path = os.environ.get("GRAFT_CONFIG")
+if _graft_config_path:
+    with open(_graft_config_path, "r", encoding="utf-8") as _graft_config_file:
+        _GRAFT_CONFIG = json.load(_graft_config_file)
+    if _GRAFT_CONFIG.get("ephemeral") is True:
+        try:
+            from canopy_admission import Admission as _CanonicalAdmission
+            from graft.lifecycle import EphemeralLifecycle
+            _GRAFT_LIFECYCLE = EphemeralLifecycle.acquire(_CanonicalAdmission)
+        except Exception as exc:
+            raise SystemExit(f"Graft ephemeral startup admission failed: {exc}") from exc
+
 import comfy.options
 comfy.options.enable_args_parsing()
 
 from comfy.cli_args import args
 from comfy.cli_args import get_console_log_level, get_file_log_outputs
+if _GRAFT_CONFIG is not None and _GRAFT_CONFIG.get("coordinator_only") is True and not args.cpu:
+    raise SystemExit("Graft coordinator_only role requires Comfy --cpu mode")
 
 if args.list_feature_flags:
     import json
@@ -10,10 +29,10 @@ if args.list_feature_flags:
     print(json.dumps(CLI_FEATURE_FLAG_REGISTRY, indent=2))  # noqa: T201
     raise SystemExit(0)
 
-import os
 import importlib.util
 import shutil
 import importlib.metadata
+import contextlib
 import folder_paths
 import time
 from comfy.cli_args import enables_dynamic_vram
@@ -74,6 +93,7 @@ if __name__ == "__main__" and args.debug_hang:
         raise KeyboardInterrupt
 
     signal.signal(signal.SIGINT, dump_traceback_on_sigint)
+
 
 import comfy_aimdo.control
 
@@ -273,6 +293,7 @@ import comfy.model_management
 import comfyui_version
 import app.logger
 import hook_breaker_ac10a0
+from canopy_admission import Admission
 
 import comfy.memory_management
 import comfy.model_patcher
@@ -333,7 +354,7 @@ def cuda_malloc_warning():
             logging.warning("\nWARNING: this card most likely does not support cuda-malloc, if you get \"CUDA error\" please run ComfyUI with: --disable-cuda-malloc\n")
 
 
-def prompt_worker(q, server_instance, asset_manager):
+def prompt_worker(q, server_instance, asset_manager, gpu_lease=None):
     current_time: float = 0.0
     cache_ram = 0
     cache_ram_inactive = 0
@@ -354,20 +375,140 @@ def prompt_worker(q, server_instance, asset_manager):
         cache_type = execution.CacheType.NONE
 
     e = execution.PromptExecutor(server_instance, cache_type=cache_type, cache_args={ "lru" : args.cache_lru, "ram" : cache_ram, "ram_inactive" : cache_ram_inactive }, asset_manager=asset_manager )
+    if gpu_lease is None:
+        gpu_lease = Admission.from_environment()
+    e.observer = None
     last_gc_collect = 0
     need_gc = False
     gc_collect_interval = 10.0
     background_scan_paused = False
+
+    def cleanup_gpu_ownership(reset_executor=True, unload_models=True):
+        if reset_executor:
+            e.reset()
+        if unload_models:
+            comfy.model_management.unload_all_models()
+            if comfy.model_management.current_loaded_models:
+                raise RuntimeError("ComfyUI still owns loaded models after GPU cleanup")
+        gc.collect()
+        comfy.model_management.soft_empty_cache()
+
+    graft_worker = getattr(server_instance, "graft_worker", None)
+
+    def ownership_context():
+        return graft_worker.admission_lock if graft_worker is not None else contextlib.nullcontext()
+
+    def release_gpu_lease():
+        with ownership_context():
+            return gpu_lease.release_if_idle(q.get_tasks_remaining(), cleanup_gpu_ownership)
+
+    def try_cleanup_with_gpu_lease(cleanup):
+        with ownership_context():
+            if q.get_tasks_remaining() or not gpu_lease.try_acquire():
+                return False
+            gpu_lease.release_after(cleanup)
+            return True
+
+    def acquire_gpu_lease():
+        if gpu_lease is None:
+            return True
+        while not comfy.model_management.processing_interrupted():
+            with ownership_context():
+                if gpu_lease.try_acquire():
+                    return True
+            time.sleep(0.1)
+        return False
+
+    def finish_gc():
+        nonlocal background_scan_paused
+        hook_breaker_ac10a0.restore_functions()
+        asset_manager.queue_output_scan()
+        asset_manager.resume_background_scan()
+        background_scan_paused = False
+
+    def finish_preexecution_interrupt(item, item_id, remove_sensitive):
+        prompt_id = item[1]
+        completed = False
+        if graft_worker is not None:
+            graft_extra = item[3].get("graft") if isinstance(item[3], dict) else None
+            try:
+                if (not isinstance(graft_extra, dict)
+                        or type(graft_extra.get("epoch")) is not int
+                        or not isinstance(graft_extra.get("job_id"), str)):
+                    raise RuntimeError("interrupted queued item has no exact Graft attempt identity")
+                graft_worker.finish_unstarted_cancel(
+                    prompt_id, graft_extra["job_id"], graft_extra["epoch"])
+                completed = True
+            except Exception:
+                graft_worker.enabled = False
+                logging.exception("Interrupted Graft attempt could not be durably finished")
+        messages = ([("execution_interrupted", {"prompt_id": prompt_id, "executed": []})]
+                    if completed else [])
+        q.task_done(item_id, {}, status=execution.PromptQueue.ExecutionStatus(
+            status_str='error', completed=False, messages=messages),
+            process_item=remove_sensitive)
+        if completed:
+            _GRAFT_LIFECYCLE.mark_work_completed()
+            if server_instance.client_id is not None:
+                asyncio.run_coroutine_threadsafe(
+                    server_instance.send("executing", {"node": None, "prompt_id": prompt_id},
+                                         server_instance.client_id),
+                    server_instance.loop).result()
+            if (q.get_tasks_remaining() == 0 and graft_worker.can_retire(q)):
+                cleanup_gpu_ownership()
+                finish_gc()
+                _GRAFT_LIFECYCLE.mark_cleanup_complete()
+                server_instance.retire_ephemeral()
+                return True
+        return False
 
     while True:
         try:
             timeout = 1000.0
             if need_gc:
                 timeout = max(gc_collect_interval - (current_time - last_gc_collect), 0.0)
+            if gpu_lease is not None and (gpu_lease.held or _GRAFT_LIFECYCLE is not None):
+                timeout = min(timeout, 1.0)
 
             queue_item = q.get(timeout=timeout)
-            if queue_item is not None:
+            if queue_item is None and _GRAFT_LIFECYCLE is not None:
+                if (_GRAFT_LIFECYCLE.retirement_due() and graft_worker is not None
+                        and graft_worker.can_retire(q)):
+                    cleanup_gpu_ownership()
+                    finish_gc()
+                    _GRAFT_LIFECYCLE.mark_cleanup_complete()
+                    server_instance.retire_ephemeral()
+                    return
+                if need_gc:
+                    gc.collect()
+                    comfy.model_management.soft_empty_cache()
+                    finish_gc()
+                    need_gc = False
+            elif queue_item is None and gpu_lease is not None and gpu_lease.held:
+                release_gpu_lease()
+                finish_gc()
+                need_gc = False
+            elif queue_item is not None:
                 item, item_id = queue_item
+                remove_sensitive = lambda prompt: prompt[:5] + prompt[6:]
+                admitted = gpu_lease is None or acquire_gpu_lease()
+                interrupted = gpu_lease is not None and comfy.model_management.processing_interrupted()
+                if not admitted or interrupted:
+                    nodes.interrupt_processing(False)
+                    if _GRAFT_LIFECYCLE is not None and interrupted:
+                        if finish_preexecution_interrupt(item, item_id, remove_sensitive):
+                            return
+                    else:
+                        q.task_done(item_id, {}, status=execution.PromptQueue.ExecutionStatus(
+                            status_str='error', completed=False, messages=[]), process_item=remove_sensitive)
+                        if _GRAFT_LIFECYCLE is not None and graft_worker is not None:
+                            graft_worker.enabled = False
+                        if _GRAFT_LIFECYCLE is None and interrupted and release_gpu_lease():
+                            finish_gc()
+                            need_gc = False
+                    continue
+                if gpu_lease is not None:
+                    nodes.interrupt_processing(False)
                 execution_start_time = time.perf_counter()
                 prompt_id = item[1]
                 server_instance.last_prompt_id = prompt_id
@@ -380,23 +521,65 @@ def prompt_worker(q, server_instance, asset_manager):
 
                 asset_manager.pause_background_scan()
                 background_scan_paused = True
-                e.execute(item[2], prompt_id, extra_data, item[4])
+                observer = None
+                finish_attempted = False
+                try:
+                    if graft_worker is not None:
+                        observer = graft_worker.observer(prompt_id, item[2], extra_data)
+                    if observer is not None:
+                        e.reset()
+                    e.observer = observer
+                    e.execute(item[2], prompt_id, extra_data, item[4])
+                    if observer is not None:
+                        finish_attempted = True
+                        observer.finish(e.success, e.history_result, e.status_messages)
+                except Exception:
+                    logging.exception("Prompt observer or execution failed")
+                    e.success = False
+                    e.history_result = {}
+                    if observer is not None and not finish_attempted:
+                        try:
+                            observer.finish(False, {}, e.status_messages)
+                        except Exception:
+                            logging.exception("Graft failure could not be reported to authority")
+                finally:
+                    e.observer = None
 
                 need_gc = True
 
-                remove_sensitive = lambda prompt: prompt[:5] + prompt[6:]
                 q.task_done(item_id,
                             e.history_result,
                             status=execution.PromptQueue.ExecutionStatus(
                                 status_str='success' if e.success else 'error',
                                 completed=e.success,
                                 messages=e.status_messages), process_item=remove_sensitive)
+                if (_GRAFT_LIFECYCLE is None and gpu_lease is not None
+                        and release_gpu_lease()):
+                    finish_gc()
+                    need_gc = False
                 if q.get_tasks_remaining() == 0:
                     # Nothing else is queued, so let the background scan run now rather than on the next GC tick.
                     asset_manager.resume_background_scan()
                 if server_instance.client_id is not None:
-                    server_instance.send_sync("executing", {"node": None, "prompt_id": prompt_id}, server_instance.client_id)
-                server_instance.workflow_metadata = {}
+                    if _GRAFT_LIFECYCLE is not None:
+                        asyncio.run_coroutine_threadsafe(
+                            server_instance.send("executing", {"node": None, "prompt_id": prompt_id},
+                                                 server_instance.client_id),
+                            server_instance.loop).result()
+                    else:
+                        server_instance.send_sync("executing", {"node": None, "prompt_id": prompt_id},
+                                                  server_instance.client_id)
+
+                if _GRAFT_LIFECYCLE is not None and graft_worker is not None:
+                    graft_worker.complete_prompt(prompt_id)
+                    _GRAFT_LIFECYCLE.mark_work_completed()
+                if (_GRAFT_LIFECYCLE is not None and graft_worker is not None
+                        and q.get_tasks_remaining() == 0 and graft_worker.can_retire(q)):
+                    cleanup_gpu_ownership()
+                    finish_gc()
+                    _GRAFT_LIFECYCLE.mark_cleanup_complete()
+                    server_instance.retire_ephemeral()
+                    return
 
                 current_time = time.perf_counter()
                 execution_time = current_time - execution_start_time
@@ -411,21 +594,32 @@ def prompt_worker(q, server_instance, asset_manager):
             flags = q.get_flags()
             free_memory = flags.get("free_memory", False)
 
-            if flags.get("unload_models", free_memory):
-                comfy.model_management.unload_all_models()
-                need_gc = True
-                last_gc_collect = 0
-
-            if free_memory:
-                e.reset()
-                need_gc = True
+            if flags.get("unload_models", free_memory) or free_memory:
+                if gpu_lease is None:
+                    if flags.get("unload_models", free_memory):
+                        comfy.model_management.unload_all_models()
+                    if free_memory:
+                        e.reset()
+                    need_gc = True
+                elif gpu_lease.held:
+                    with ownership_context():
+                        cleanup_gpu_ownership(free_memory, flags.get("unload_models", free_memory))
+                    need_gc = True
+                elif try_cleanup_with_gpu_lease(lambda: cleanup_gpu_ownership(
+                        True, flags.get("unload_models", free_memory))):
+                    finish_gc()
+                    need_gc = False
+                else:
+                    logging.info("Skipping GPU cleanup because another owner holds the configured device lease")
+                    need_gc = False
                 last_gc_collect = 0
 
             if need_gc:
                 current_time = time.perf_counter()
                 if (current_time - last_gc_collect) > gc_collect_interval:
                     gc.collect()
-                    comfy.model_management.soft_empty_cache()
+                    if gpu_lease is None or gpu_lease.held:
+                        comfy.model_management.soft_empty_cache()
                     last_gc_collect = current_time
                     need_gc = False
                     hook_breaker_ac10a0.restore_functions()
@@ -441,6 +635,18 @@ def prompt_worker(q, server_instance, asset_manager):
                     asset_manager.resume_background_scan()
                 except Exception:
                     logging.exception("Failed to resume background asset scanning after prompt worker failure")
+            if gpu_lease is not None and gpu_lease.held:
+                if _GRAFT_LIFECYCLE is None:
+                    release_gpu_lease()
+                    finish_gc()
+                else:
+                    safe_to_exit = (_GRAFT_LIFECYCLE.retiring or
+                                    (graft_worker is not None and graft_worker.can_retire(q)))
+                    _GRAFT_LIFECYCLE.fail_retirement()
+                    if safe_to_exit:
+                        server_instance.retire_ephemeral()
+                    else:
+                        logging.critical("Ephemeral worker failure left unresolved Graft work; retaining admission and process")
             raise
 
 
@@ -591,13 +797,33 @@ def start_comfyui(asyncio_loop=None):
                                          f"{get_missing_requirements_message()}\n{WITHOUT_ASSETS}")
     asset_manager: AssetManager = default_asset_manager()
     feature_flags.SERVER_FEATURE_FLAGS["assets"] = asset_manager.enabled
-    if not asset_manager.enabled:
+    if not asset_manager.enabled and _GRAFT_LIFECYCLE is None:
         cleanup_temp_filesystem()
 
     if not asyncio_loop:
         asyncio_loop = asyncio.new_event_loop()
         asyncio.set_event_loop(asyncio_loop)
     prompt_server = server.PromptServer(asyncio_loop, asset_manager)
+    if _GRAFT_LIFECYCLE is not None:
+        from aiohttp import web
+        @web.middleware
+        async def reject_native_prompt(request, handler):
+            if request.method == "POST" and request.path.removeprefix("/api") == "/prompt":
+                return web.json_response({"error": "native prompt submission is disabled on ephemeral Graft workers"}, status=409)
+            return await handler(request)
+        prompt_server.app.middlewares.append(reject_native_prompt)
+    graft_lease = None
+    if _GRAFT_CONFIG is not None:
+        from graft import install
+        install(prompt_server, _GRAFT_CONFIG)
+        graft_lease = (_GRAFT_LIFECYCLE.admission if _GRAFT_LIFECYCLE is not None
+                       else Admission.from_environment())
+        if getattr(prompt_server, "graft_worker", None) is not None:
+            if _GRAFT_LIFECYCLE is not None:
+                prompt_server.graft_worker.bind_lifecycle(_GRAFT_LIFECYCLE)
+                prompt_server.retire_ephemeral = lambda: asyncio_loop.call_soon_threadsafe(asyncio_loop.stop)
+            else:
+                prompt_server.graft_worker.bind_admission(graft_lease)
 
     if args.enable_manager and not args.disable_manager_ui:
         comfyui_manager.start()
@@ -622,7 +848,9 @@ def start_comfyui(asyncio_loop=None):
     prompt_server.add_routes()
     hijack_progress(prompt_server)
 
-    threading.Thread(target=prompt_worker, daemon=True, args=(prompt_server.prompt_queue, prompt_server, asset_manager)).start()
+    if _GRAFT_CONFIG is None or _GRAFT_CONFIG.get("coordinator_only") is not True:
+        threading.Thread(target=prompt_worker, daemon=True,
+                         args=(prompt_server.prompt_queue, prompt_server, asset_manager, graft_lease)).start()
 
     if args.quick_test_for_ci:
         exit(0)
@@ -647,6 +875,13 @@ def start_comfyui(asyncio_loop=None):
                 open_browser(scheme, address, port)
             app.agent_host.start(prompt_server, scheme, address, port)
         call_on_start = start_agent
+    if _GRAFT_LIFECYCLE is not None:
+        original_call_on_start = call_on_start
+        def mark_worker_ready(scheme, address, port):
+            _GRAFT_LIFECYCLE.mark_ready()
+            if original_call_on_start is not None:
+                original_call_on_start(scheme, address, port)
+        call_on_start = mark_worker_ready
 
     async def start_all():
         await prompt_server.setup()
@@ -684,8 +919,17 @@ if __name__ == "__main__":
         x = start_all_func()
         app.logger.print_startup_warnings()
         event_loop.run_until_complete(x)
+    except RuntimeError as exc:
+        if (_GRAFT_LIFECYCLE is None or not _GRAFT_LIFECYCLE.retiring
+                or not _GRAFT_LIFECYCLE.cleanup_complete
+                or _GRAFT_LIFECYCLE.retirement_failed
+                or str(exc) != "Event loop stopped before Future completed."):
+            raise
+        logging.info("Ephemeral Graft worker retired after cleanup")
     except KeyboardInterrupt:
         logging.info("\nStopped server")
     finally:
         app.agent_host.stop()
         prompt_server.asset_manager.shutdown()
+        if getattr(prompt_server, "graft_worker", None) is not None:
+            prompt_server.graft_worker.close()
